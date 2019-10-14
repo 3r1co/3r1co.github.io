@@ -1,0 +1,73 @@
+<!doctype html><html lang=en-us><head><meta charset=utf-8><meta http-equiv=x-ua-compatible content="IE=edge,chrome=1"><meta name=viewport content="width=device-width,initial-scale=1"><meta name=generator content="Hugo 0.58.3"><title>Nginx, Letsencrypt, Kong and how it makes life easy &middot; 3r1.co</title><link rel="shortcut icon" href=https://3r1.coimages/favicon.ico><link rel=stylesheet href=https://3r1.cocss/style.css><link rel=stylesheet href=https://3r1.cocss/highlight.css><link rel=stylesheet href=https://3r1.cocss/monosocialiconsfont.css></head><body><nav class=main-nav><a href=https://3r1.co><span class=arrow>←</span>Home</a>
+<a href=https://3r1.coposts>Archive</a>
+<a href=https://3r1.cotags>Tags</a>
+<a href=https://3r1.coabout>About</a></nav><section id=wrapper class=post><article><header><h1>Nginx, Letsencrypt, Kong and how it makes life easy</h1><h2 class=headline>Feb 16, 2017 14:53
+· 1094 words
+· 6 minute read
+<span class=tags></span></h2></header><section id=post-body><p>This Blog post is going to address several topics that were bothering me in the last days and weeks:</p><ul><li>How do I add most comfortably new SSL Certificates to my server without causing a downtime for the blog?</li><li>How do I add new services to my server, expose them to the internet, have automatic HTTPS enabled and can how I can I protect them most easily?</li></ul><p><img src="https://www.gliffy.com/go/share/image/s3yw0bypn9e6p5p8a3hl.png?utm_medium=live-embed&amp;utm_source=custom" alt="My Setup"></p><h1 id=the-nginx-setup>The Nginx Setup</h1><p>So, talking about the first point, the downtime was really struggeling me. Everytime I wanted to add a new subdomain to my Nginx, I had to stop it, start the <a href=https://certbot.eff.org>Certbot</a> container, wait for the certificate and restart the Nginx when this was done.
+I thought I could do better, so I started building a setup with docker-compose. The nginx image is pretty standard, it mounts a custom configuration, two shared volumes and is connected to a dedicated network, that I will explain later on:</p><pre><code>nginx:
+    image: nginx:alpine
+    ports:
+      - &quot;80:80&quot;
+      - &quot;443:443&quot;
+    volumes:
+      - ./conf/:/etc/nginx/conf.d/:ro
+      - www_letsencrypt:/var/www/letsencrypt:ro
+      - etc_letsencrypt:/etc/letsencrypt:ro
+    networks:
+      - outside
+</code></pre><p>So my idea here was that the Nginx and the Certbot share the volume etc_letsencrypt for the certificates and www_letsencrypt for the acme challenge (more on that below). As you can see, all volume mounts of the Nginx are readonly, so no attacker will be able to modify any of my certificates or configurations in case he gains access to Nginx.</p><p>Now to the Certbot part:</p><pre><code>  letsencrypt:
+    image: quay.io/letsencrypt/letsencrypt:latest
+    command: certonly --agree-tos -n -m $LE_MAIL --webroot -w /www --expand $DOMAIN_ARGS
+    volumes:
+      - etc_letsencrypt:/etc/letsencrypt
+      - www_letsencrypt:/www
+</code></pre><p>To automate the certificate generation, you have add several parameters in the command section:</p><ul><li>&ldquo;certonly&rdquo; - to generate or renew any certificate that is given as a parameter</li><li>&ldquo;agree-tos&rdquo; - so that you don&rsquo;t have to confirm the ToS manually</li><li>&rdquo;-n&rdquo; - Non-interactive</li><li>&rdquo;-m&rdquo; - with the registration mail address, in my case I store it in an environment variable in the .env file</li><li>&rdquo;&ndash;webroot -w /www&rdquo; - Use the Certbot <a href=https://certbot.eff.org/docs/using.html#webroot>webroot</a> technique, so generate the challenge tokens in /www, which is mounted to /var/www/letsencrypt in the nginx container</li><li>&ndash;expand - Expand already existing certificates</li><li>$DOMAIN_ARGS - an environment variable that I store in .env next to the docker-compose file. For example:<ul><li>DOMAIN_ARGS=-d domain.com -d sub.domain.com</li></ul></li></ul><p>The last step is the Nginx configuration. The Certbot verifies that you are the owner of a domain with a token that he places in the location /.well-known/acme-challenge/ of your webserver. Since I want to redirect everything else anyway to HTTPS, the Nginx Configuration looks pretty simple:</p><pre><code>server {
+    listen 80;
+
+    server_name  _ ;
+
+    location /.well-known/acme-challenge/ {
+        root  /var/www/letsencrypt;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+</code></pre><p>In my case, Nginx is only used for the HTTPS termination. It is the reserve proxy for Kong, which running in a separate container. For sure, Kong could do that Job as well, but I like the separation of concerns.</p><p>Like that, all certificates for domains in the DOMAIN_ARGS variable will be automatically generated / renewed once I start the letsencrypt container with &ldquo;docker-compose up letsencrypt&rdquo;. I set up a cronjob that is doing that every night, that way the certificates are automatically renewed once they are going to expire. You can find all of the sources as well in my <a href=https://github.com/3r1co/nginx>Github Repository</a>.</p><p>One Remark regarding the docker-compose version: You will see in my examples that all my compose files are already in version 3 except the one of nginx. Why is that the case? Because there is a bug in Dockers Swarm which prevents me from retrieving a users IP address (see <a href=https://github.com/docker/docker/issues/25526>here</a>). As I&rsquo;m aggregating all logs in Elasticsearch and visualize them with Kibana, I wasn&rsquo;t able to see anymore where my visitors came from with this bug. Thats why the nginx is still working compose version 2.</p><p>So this all nice, but how do I actually serve content, like this Blog for example?</p><h1 id=playing-with-the-monkey>Playing with the Monkey</h1><p>As described initially, I my goal was to find a way to easily expose new services to the internet while keeping the access safe and secure at the same time. That meant:</p><ul><li>I want HTTPS by default, which is already managed by Nginx above</li><li>I want to be able to easily add access control</li><li>Additionally, I want a way to easily aggregate access logs in Elasticsearch, so I can see if this Blog is visited at all</li></ul><p>Since some time people are talking about <a href=https://getkong.org>Kong</a>. The idea of a central API Gateway sounded interesting to me and the available plugins convinced me to give it a try.</p><p>The setup of Kong with docker is pretty straight forward. Kong allows you to use two databases: Postgres and Cassandra. I tried the two, but for my use case Postgres seems to be more appropriate as it consumes less resources, which is critical on my 4GB VM. So, Postgres setup is pretty standard. I&rsquo;m persisting Postgres data as I don&rsquo;t want to recreate my APIs with each DB restart.</p><pre><code>  db:
+    image: postgres:9.4
+    environment:
+      - &quot;POSTGRES_USER=kong&quot;
+      - &quot;POSTGRES_DB=kong&quot;
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    networks:
+      - default
+</code></pre><p>Adding Kong is simple as well:</p><pre><code>  kong:
+    image: kong
+    environment:
+      - &quot;KONG_DATABASE=postgres&quot;
+      - &quot;KONG_PG_HOST=db&quot;
+    ports:
+      - &quot;127.0.0.1:8001:8001&quot;
+    depends_on:
+      - db
+    networks:
+      - outside
+      - default
+</code></pre><p>I expose port 8001 (the Kong Admin Port) to localhost, that way I can easily add new APIs or Plugins with curl.</p><p>As you can see, Kong is connected to two networks: default and outside. The default network is the on where Kong communicates with Postgres. The Outside network is shared between Kong and Nginx:</p><pre><code>networks:
+  default:
+    driver: overlay
+  outside:
+    external:
+      name: rp
+</code></pre><p>Additionally, I added as well a very nice dashboard to manage Kong:</p><pre><code>  dashboard:
+    image: pgbi/kong-dashboard
+    networks:
+      - default
+</code></pre><p>As you could already assume, I will expose this dashboard with Kong, so I won&rsquo;t be able to access the dashboard before I do the following curl request:</p><pre><code>curl -i -X POST \
+  --url http://localhost:8001/apis/ \
+  --data 'request_host=dashboard.mydomain.com' \
+  --data 'upstream_url=http://dashboard:8080'
+</code></pre><p>After all went well, I could access my beautiful, HTTPS encrypted dashboard under the URL of the request_host parameter!</p><p>With Kong, I can now protect all my non-public services like Kibana and Grafana with HTTP Basic Auth, OAuth2 or LDAP. I use the TCP Log Plugin to send access logs directly to Logstash (which I will explain in a later Blog post). It gives me an incredibly easy way to manage my services and to add new functionalities without causing any downtime. You can find my Kong docker-compose file on Github as well: <a href=https://github.com/3r1co/kong>https://github.com/3r1co/kong</a> .</p><p>I hope this was interesting for you, see you next time!</p></section></article><footer id=footer><p class=small>© Copyright 2019 <i class="fa fa-heart" aria-hidden=true></i></p><p class=small>Powered by <a href=http://www.gohugo.io/>Hugo</a> Theme By <a href=https://github.com/nodejh/hugo-theme-cactus-plus>nodejh</a></p></footer></section><script src=https://3r1.cojs/jquery-3.3.1.min.js></script><script src=https://3r1.cojs/main.js></script><script src=https://3r1.cojs/highlight.min.js></script><script>hljs.initHighlightingOnLoad();</script></body></html>
